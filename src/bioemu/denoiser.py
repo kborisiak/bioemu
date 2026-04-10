@@ -125,6 +125,7 @@ def get_score(
         t: Diffusion timestep. Shape [batch_size,]
     """
     tmp = score_model(batch, t)
+
     # Score is in axis angle representation [N,3] (vector is along axis of rotation, vector length
     # is rotation angle in radians).
     assert isinstance(sdes["node_orientations"], SO3SDE)
@@ -141,9 +142,98 @@ def get_score(
     )
     pos_score = tmp["pos"] / pos_std
 
+    # if score model returns divergence, store that as well
+    if "div_pos_score" in tmp:
+        div_pos_score = tmp["div_pos_score"] / pos_std[0]  # div score is a scalar per sample, so divide by scalar std
+        return {
+            "node_orientations": node_orientations_score,
+            "pos": pos_score,
+            "div_pos_score": div_pos_score
+        }
+        
     return {"node_orientations": node_orientations_score, "pos": pos_score}
+    
 
-
+def euler_maruyama_denoiser(
+    *,
+    sdes: dict[str, SDE],
+    N: int,
+    eps_t: float,
+    max_t: float,
+    device: torch.device,
+    batch: Batch,
+    score_model: torch.nn.Module,
+    noise: float,
+    **kwargs,
+    ) -> ChemGraph:
+    """Sample from prior and then denoise using the simplest denoiser."""
+    batch = batch.to(device)
+    if isinstance(score_model, torch.nn.Module):
+        score_model = score_model.to(device)
+    assert isinstance(sdes["node_orientations"], torch.nn.Module)
+    sdes["node_orientations"] = sdes["node_orientations"].to(device)
+    batch = batch.replace(
+        pos = sdes["pos"].prior_sampling(batch.pos.shape, device=device),
+        node_orientations = sdes["node_orientations"].prior_sampling(
+            batch.node_orientations.shape, device=device
+        ),
+    )
+    
+    U_1_pos = sdes["pos"].U_prior(batch['pos'], batch.batch)
+    ts_min = 0.0
+    ts_max = 1.0
+    timesteps = torch.linspace(max_t, eps_t, N, device=device)
+    dt = -torch.tensor((max_t-eps_t)/ (N-1)).to(device)
+    fields = list(sdes.keys()) # "node orientations" and "pos"
+    predictors = {
+        name: EulerMaruyamaPredictor(
+            corruption=sde, noise_weight=noise, marginal_concentration_factor=1.0
+        )
+        for name, sde in sdes.items()
+    }
+    batch_size = batch.num_graphs
+    
+    test_zeros = torch.zeros_like(U_1_pos)
+    batch = batch.replace(div_pos_velocity=-U_1_pos) # W_v = U0 + [- U1 + int_0^t div v dt.] 
+    # print(batch.div_pos_velocity)
+    batch = batch.replace(div_pos_score=test_zeros)
+    for i in range(N):
+        # set the timestep
+        t = torch.full((batch_size, ), timesteps[i], device=device)
+        t_next = t + dt
+        
+        # get score
+        score = get_score(batch=batch, t = t, score_model=score_model, sdes=sdes)
+        
+        # denoise step
+        drift = {}
+        diffusion = {}
+        for field in fields:
+            drift[field], diffusion[field]  = predictors[field].reverse_drift_and_diffusion(x=batch[field], t=t, batch_idx = batch.batch, score = score[field])
+        
+        for field in fields:
+            batch[field], _ = predictors[field].update_given_drift_and_diffusion(
+                x = batch[field],
+                dt = (t_next - t)[0],
+                drift = drift[field],
+                diffusion = diffusion[field]
+            )
+        
+        # integrate div pos score if it exists
+        # pos: div v = -1/2 g^2 (3N + div_pos_score)
+        if "div_pos_score" in score:
+            div_pos_score = score["div_pos_score"]
+            # print(f"div pos score at step {i}: {div_pos_score}")
+            
+            # divergence of velocity field at current time
+            dim = batch.pos.shape[-1] # dimension of position space, typically 3, 1 for testing
+            div_v_pos = -0.5 * diffusion["pos"][0]**2 * (dim * torch.bincount(batch.batch) + div_pos_score) 
+            
+            # simple integration step: I_next = I_now + div_v(t) * dt
+            batch = batch.replace(div_pos_velocity= batch.div_pos_velocity - div_v_pos * (t_next - t)[0])
+        
+    return batch
+            
 def heun_denoiser(
     *,
     sdes: dict[str, SDE],
@@ -154,6 +244,7 @@ def heun_denoiser(
     batch: Batch,
     score_model: torch.nn.Module,
     noise: float,
+    **kwargs,
 ) -> ChemGraph:
     """Sample from prior and then denoise."""
 
@@ -286,6 +377,7 @@ def dpm_solver(
             - guidance_strength: Controls the strength of guidance steering (default: 3.0)
             - Other steering parameters (start, end, num_particles, etc.)
     """
+
     grad_is_enabled = torch.is_grad_enabled()
     assert isinstance(batch, Batch)
     assert max_t < 1.0

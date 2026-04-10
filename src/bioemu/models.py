@@ -11,6 +11,10 @@ from torch_geometric.utils import to_dense_adj, to_dense_batch
 from .chemgraph import ChemGraph
 from .structure_module import StructureModule
 
+# temp 
+import time
+
+
 # Number of dimensions for the nodes and edges of Evoformer embeddings
 EVOFORMER_NODE_DIM: int = 384
 EVOFORMER_EDGE_DIM: int = 128
@@ -387,3 +391,91 @@ class DiGConditionalScoreModel(torch.nn.Module):
         )
 
         return x.replace(pos=pos, node_orientations=node_orientations)
+
+
+class DiGConditionalScoreDivergenceModel(torch.nn.Module):
+    """Wrapper to convert the DiG nn.Module neural network that operates directly on position
+    and rotation tensors into a ScoreModel that operates on ChemGraph objects. Also computes the divergence of the score with respect to the input positions and orientations, using the Hutchinson's trace estimator.
+    """
+
+    def __init__(
+        self,
+        dim_model: int = 512,
+        dim_pair: int = 256,
+        num_layers: int = 8,
+        num_heads: int = 32,
+        dim_single_rep: int = 64,
+        dim_hidden: int = 1024,
+        num_buckets: int = 64,
+        max_distance_relative: int = 128,
+        dropout: float = 0.1,
+        extra_residue_embeds: bool = False,
+        hutchinson_samples: int = 1,
+    ):
+        """
+        Args: all passed through to DistributionalGraphormer
+        """
+        super().__init__()
+        self.model_nn = DistributionalGraphormer(
+            dim_model=dim_model,
+            dim_pair=dim_pair,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dim_single_rep=dim_single_rep,
+            dim_hidden=dim_hidden,
+            num_buckets=num_buckets,
+            max_distance_relative=max_distance_relative,
+            dropout=dropout,
+            extra_residue_embeds=extra_residue_embeds,
+        )
+        self.hutchinson_samples = hutchinson_samples
+
+    def forward(self, x: ChemGraph, t: torch.Tensor) -> ChemGraph:
+        # NOTE: the DiG structure model uses a time embedding intended for integer time
+        # steps between 0 and num_timesteps (1000 by default). The SDE gets times between
+        # 0 and 1, where the filter used in the embedding is less expressive. To avoid
+        # this, t is scaled by the timesteps before passing to model.
+        assert hasattr(x, "batch"), "batch of ChemGraphs must have a 'batch' attribute."
+        time_effective = t[x.batch] * 1000
+        # NOTE: DiG takes in inverse rotations as input. To be consistent
+        # with frame conventions and sampling in the rest of the code, frames are transposed
+        # / inverted here.
+        node_orientations_effective = x.node_orientations.swapaxes(-1, -2)
+
+        context = x.replace(pos=None, node_orientations=None)
+
+        # pos is the translation score, node_orientations is the rotation score in axis
+        # angle representation.
+        pos_effective = x.pos
+        
+        div_pos_score = 0
+        for _ in range(self.hutchinson_samples):  # number of samples for Hutchinson's trace estimator, can be increased for better accuracy at the cost of compute.
+            # Sample radamacher vector for Hutchinson's estimator. This should have the same shape as the input to the model.
+            generator = torch.Generator(device=pos_effective.device)
+            generator.manual_seed(time.time_ns())
+            
+            v_pos = torch.randint_like(pos_effective, low=0, high=2, generator=generator) * 2 - 1
+            v_rot = torch.randint_like(node_orientations_effective, low=0, high=2, generator=generator) * 2 - 1
+            # jvp
+            pos_effective.requires_grad_(True)
+            node_orientations_effective.requires_grad_(True)
+            
+            def model_fn(pos, node_orientations):
+                return self.model_nn(
+                    x=pos,
+                    node_orientations=node_orientations,
+                    batch_index=x.batch,
+                    t=time_effective,
+                    context=context,
+                )
+            
+            (pos, node_orientations), (jvp_pos, _) = torch.autograd.functional.jvp(model_fn, (pos_effective, node_orientations_effective), (v_pos, v_rot)
+            )
+            batch_index = x.batch
+            v_pos = to_dense_batch(v_pos, batch_index)[0]  # [B, L, 3]
+            jvp_pos = to_dense_batch(jvp_pos, batch_index)[0]  #
+            div_pos_score += torch.einsum("bi,bi->b", v_pos.flatten(1, -1), jvp_pos.flatten(1, -1))  # accumulate Hutchinson's estimator for the divergence of the position score. This will be averaged over the number of samples taken in the Hutchinson's estimator.
+
+        div_pos_score = div_pos_score / self.hutchinson_samples # average over the number of samples in Hutchinson's estimator to get the final divergence estimate.
+
+        return x.replace(pos=pos, node_orientations=node_orientations, div_pos_score=div_pos_score)

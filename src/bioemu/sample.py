@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DENOISER_CONFIG_DIR = Path(__file__).parent / "config/denoiser/"
 DEFAULT_STEERING_CONFIG_DIR = Path(__file__).parent / "config/steering/"
-SupportedDenoisersLiteral = Literal["dpm", "heun"]
+SupportedDenoisersLiteral = Literal["dpm", "heun", "euler_maruyama"]
 SUPPORTED_DENOISERS = list(typing.get_args(SupportedDenoisersLiteral))
 
 # Mapping used in training of BioEmu-1.2 model.
@@ -85,6 +85,7 @@ def main(
     filter_samples: bool = True,
     steering_config: str | Path | dict | None = None,
     base_seed: int | None = None,
+    seed: int | None = None,
 ) -> None:
     """
     Generate samples for a specified sequence, using a trained model.
@@ -118,6 +119,7 @@ def main(
             - resampling_interval: Resampling interval
             - potentials: Dict of potential configurations
         base_seed: Base random seed for sampling. If set, each batch's seed will be set to base_seed + (num samples already generated).
+        seed: Override base seed + index seeding and just use this seed for all batches. Useful for debugging to generate identical samples across runs.
     """
 
     if base_seed is None:
@@ -253,7 +255,10 @@ def main(
                 f"Not sure why {npz_path} already exists when so far only "
                 f"{existing_num_samples} samples have been generated."
             )
-        seed = base_seed + start_idx
+            
+        if seed is None:
+            seed = base_seed + start_idx
+            
         logger.info(f"Sampling with {seed=} ({base_seed=})")
         batch = generate_batch(
             score_model=score_model,
@@ -337,6 +342,7 @@ def get_context_chemgraph(
         pair_embeds=pair_embeds,
         sequence=sequence,
         node_labels=node_labels,
+        div_pos_velocity=torch.tensor(0.0),
     )
 
 
@@ -392,8 +398,9 @@ def generate_batch(
     node_orientations = torch.stack([x.node_orientations for x in sampled_chemgraphs]).to(
         "cpu"
     )  # [BS, L, 3, 3]
+    div_pos_velocity = torch.stack([x.div_pos_velocity for x in sampled_chemgraphs]).to("cpu")  # [BS, L, 3]
 
-    return {"pos": pos, "node_orientations": node_orientations}
+    return {"pos": pos, "node_orientations": node_orientations, "div_pos_velocity": div_pos_velocity}
 
 
 if __name__ == "__main__":

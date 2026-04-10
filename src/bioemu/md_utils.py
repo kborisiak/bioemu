@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def _add_oxt_to_terminus(
     topology: app.Topology, positions: u.Quantity
 ) -> tuple[app.Topology, u.Quantity]:
-    """Add an OXT atom to the C-terminal residue of the given topology and positions.
+    """Add an OXT atom to the C-terminal residue of the given topology and positions. If the OXT atom already exists, the topology and positions are returned unchanged.
 
     NOTE: this uses a heuristics for the OXT position
 
@@ -31,7 +31,8 @@ def _add_oxt_to_terminus(
     new_topology = app.Topology()
     new_positions = []
 
-    # Copy existing chains, residues, and atoms to the new topology
+    # Check if OXT atom already exists
+    oxt_exists = False
     for chain in topology.chains():
         new_chain = new_topology.addChain(chain.id)
         for residue in chain.residues():
@@ -39,20 +40,26 @@ def _add_oxt_to_terminus(
             for atom in residue.atoms():
                 new_topology.addAtom(atom.name, atom.element, new_residue)
                 new_positions.append(positions[atom.index])
+                if atom.name == "OXT":
+                    oxt_exists = True
+                
+            if oxt_exists:
+                break
+            
+    # Add OXT atom to the C-terminal residue
+    if not oxt_exists and residue.id == list(chain.residues())[-1].id:
+        print(f"Adding OXT atom to residue {residue.id}, {residue.name}.")
+        new_topology.addAtom("OXT", app.element.oxygen, new_residue)
+        atom_positions = {a.name: positions[a.index] for a in residue.atoms()}
 
-            # Add OXT atom to the C-terminal residue
-            if residue.id == list(chain.residues())[-1].id:
-                new_topology.addAtom("OXT", app.element.oxygen, new_residue)
-                atom_positions = {a.name: positions[a.index] for a in residue.atoms()}
+        # slightly modified version of PDBFixer's OXT position heuristic
+        d_ca_o = atom_positions["O"] - atom_positions["CA"]
+        d_ca_c = atom_positions["C"] - atom_positions["CA"]
+        d_ca_c /= u.sqrt(u.dot(d_ca_c, d_ca_c))
+        v = d_ca_o - u.dot(d_ca_c, d_ca_o) * d_ca_c
 
-                # slightly modified version of PDBFixer's OXT position heuristic
-                d_ca_o = atom_positions["O"] - atom_positions["CA"]
-                d_ca_c = atom_positions["C"] - atom_positions["CA"]
-                d_ca_c /= u.sqrt(u.dot(d_ca_c, d_ca_c))
-                v = d_ca_o - u.dot(d_ca_c, d_ca_o) * d_ca_c
-
-                oxt_position = atom_positions["O"] + 2 * v
-                new_positions.append(oxt_position)
+        oxt_position = atom_positions["O"] + 2 * v
+        new_positions.append(oxt_position)
 
     new_topology.createStandardBonds()
 
@@ -242,7 +249,7 @@ def _run_and_write(
         file_prefix: prefix for output xtc file
     """
     state_data_reporter = app.StateDataReporter(
-        stdout,
+        os.path.join(outpath, f"{file_prefix}_state_info.csv"),
         int(100 / integrator_timestep_ps),
         time=True,
         potentialEnergy=True,

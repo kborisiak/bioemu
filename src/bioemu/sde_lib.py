@@ -13,6 +13,7 @@ import logging
 import numpy as np
 import torch
 from torch._prims_common import DeviceLikeType
+from torch_geometric.utils import to_dense_batch
 
 
 def _broadcast_like(x, like):
@@ -127,6 +128,7 @@ class BaseVPSDE(SDE):
         batch_idx: torch.LongTensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         mean_coeff = self._marginal_mean_coeff(t)
+        
         mean = maybe_expand(mean_coeff, batch_idx, x) * x
         std = maybe_expand(torch.sqrt(1.0 - mean_coeff**2), batch_idx, x)
         return mean, std
@@ -140,6 +142,11 @@ class BaseVPSDE(SDE):
         device: DeviceLikeType | None = None,
     ) -> torch.Tensor:
         return torch.randn(*shape, device=device)
+    
+    def U_prior(self, x: torch.Tensor, batch_idx: torch.LongTensor | None = None) -> torch.Tensor:
+        """Returns the potential energy of the prior distribution, up to an additive constant."""
+        x, _= to_dense_batch(x, batch_idx) if batch_idx is not None else (x, None)
+        return 0.5 * torch.einsum("bij,bij->b", x, x)  # (batch_size,)
 
     def sde(
         self,

@@ -152,6 +152,10 @@ def run_one_md(
     system, modeller = _prepare_system(frame)
     ext_force_id = _add_constraint_force(system, modeller, constraint_force_const)
 
+    constraint_force = system.getForce(ext_force_id)
+    constraint_force.setForceGroup(1)  # Set the contraint forces to a seperate group so we can exclude them from the potential energy calculation.
+    
+
     # use high Langevin friction to relax the system quicker
     integrator = mm.LangevinIntegrator(
         temperature_K,
@@ -193,8 +197,16 @@ def run_one_md(
         )
 
     # always return constrained equilibration output
-    positions = simulation.context.getState(positions=True).getPositions()
-
+    state = simulation.context.getState(positions=True, energy=True, groups={0})  # get potential energy without constraint forces
+    all_state = simulation.context.getState(positions=True, energy=True)  # get potential energy with constraint forces (for debugging)
+    
+    positions = state.getPositions()
+    potential_energy = state.getPotentialEnergy().value_in_unit(u.kilocalories_per_mole)  # normalize by number of particles to make it comparable across different systems
+    all_state_potential_energy = all_state.getPotentialEnergy().value_in_unit(u.kilocalories_per_mole)  # potential energy with constraint forces included (for debugging)
+    
+    n_particles = system.getNumParticles()
+    potential_energies = [potential_energy, all_state_potential_energy, n_particles]
+    
     # free MD simulations if requested:
     if simtime_ns > 0.0:
 
@@ -210,11 +222,11 @@ def run_one_md(
         ).save_pdb(os.path.join(outpath, f"{file_prefix}_md_top.pdb"))
         _run_and_write(simulation, integrator_timestep_ps, simtime_ns, idx, outpath, file_prefix)
 
-    return mdtraj.Trajectory(np.array(positions.value_in_unit(u.nanometer))[idx], mdtop.subset(idx))
+    return mdtraj.Trajectory(np.array(positions.value_in_unit(u.nanometer))[idx], mdtop.subset(idx)), potential_energies
 
 
 def run_all_md(
-    samples_all: list[mdtraj.Trajectory], md_protocol: MDProtocol, outpath: str, simtime_ns: float
+    samples_all: list[mdtraj.Trajectory], md_protocol: MDProtocol, outpath: str, simtime_ns: float, save_potential_energies: bool = False,
 ) -> mdtraj.Trajectory:
     """run MD for set of samples.
 
@@ -230,12 +242,12 @@ def run_all_md(
     """
 
     equil_frames = []
-
+    potential_energies = []
     for n, frame in tqdm(
         enumerate(samples_all), leave=False, desc="running MD equilibration", total=len(samples_all)
     ):
         try:
-            equil_frame = run_one_md(
+            equil_frame, potential_energy = run_one_md(
                 frame,
                 only_energy_minimization=md_protocol == MDProtocol.LOCAL_MINIMIZATION,
                 simtime_ns=simtime_ns,
@@ -243,6 +255,7 @@ def run_all_md(
                 file_prefix=f"frame{n}",
             )
             equil_frames.append(equil_frame)
+            potential_energies.append(potential_energy)
         except ValueError as err:
             logger.warning(f"Skipping sample {n} for MD setup: Failed with\n {err}")
 
@@ -250,6 +263,13 @@ def run_all_md(
         raise RuntimeError(
             "Could not create MD setups for given system. Try running MD setup on reconstructed samples manually."
         )
+
+    if save_potential_energies:
+        potential_energy_path = os.path.join(outpath, "potential_energies.tsv")
+        with open(potential_energy_path, "w") as f:
+            f.write("frame\tpotential_energy_without_constraints_kcal_per_mol\tpotential_energy_with_constraints_kcal_per_mol\tn_particles\n")
+            for n, pe in enumerate(potential_energies):
+                f.write(f"{n}\t{pe[0]}\t{pe[1]}\t{pe[2]}" + "\n") 
 
     return mdtraj.join(equil_frames)
 
@@ -262,6 +282,7 @@ def main(
     md_protocol: MDProtocol = MDProtocol.LOCAL_MINIMIZATION,
     simtime_ns: float = 0,
     outpath: str = ".",
+    save_potential_energies: bool = False,
     prefix: str = "samples",
     verbose: bool = False,
 ) -> None:
@@ -300,7 +321,7 @@ def main(
     # run MD equilibration if requested
     if md_equil:
         samples_equil = run_all_md(
-            samples_all_heavy, md_protocol, simtime_ns=simtime_ns, outpath=outpath
+            samples_all_heavy, md_protocol, simtime_ns=simtime_ns, outpath=outpath, save_potential_energies=save_potential_energies
         )
 
         samples_equil.save_xtc(os.path.join(outpath, f"{prefix}_md_equil.xtc"))

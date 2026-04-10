@@ -35,6 +35,10 @@ def get_conda_prefix() -> str:
     Attempts to find the root Conda folder. Works with miniforge3/miniconda3
     """
     conda_root = os.getenv("CONDA_ROOT", None)
+    # check for .conda directory in home as a fallback
+    if conda_root is None and os.path.exists(os.path.expanduser("~/.conda")):
+        conda_root = os.path.expanduser("~/.conda")
+    
     if conda_root is None:
         # Attempt $CONDA_PREFIX_1 or $CONDA_PREFIX, depending
         # on whether the `base` environment is activated.
