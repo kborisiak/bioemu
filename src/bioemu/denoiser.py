@@ -179,7 +179,13 @@ def euler_maruyama_denoiser(
         ),
     )
     
-    U_1_pos = sdes["pos"].U_prior(batch['pos'], batch.batch)
+    dim = batch.pos.shape[-1] # 3 for real data, 1 for testing. Dimension of position space.
+    
+    # U_1_pos = sdes["pos"].U_prior(batch['pos'], batch.batch)
+    # p_1_likelihood = torch.distributions.Normal(loc=0.0, scale=1.0).log_prob(batch.pos).sum(-1)  # [BS*L]
+    p1 = torch.distributions.MultivariateNormal(loc=torch.zeros(dim, device=device), covariance_matrix=torch.eye(dim, device=device), )
+    p_1_likelihood = p1.log_prob(batch.pos)  # [BS*L]
+    
     ts_min = 0.0
     ts_max = 1.0
     timesteps = torch.linspace(max_t, eps_t, N, device=device)
@@ -192,11 +198,15 @@ def euler_maruyama_denoiser(
         for name, sde in sdes.items()
     }
     batch_size = batch.num_graphs
+
     
-    test_zeros = torch.zeros_like(U_1_pos)
-    batch = batch.replace(div_pos_velocity=-U_1_pos) # W_v = U0 + [- U1 + int_0^t div v dt.] 
-    # print(batch.div_pos_velocity)
-    batch = batch.replace(div_pos_score=test_zeros)
+     # W_v = U0 + [- U1 + int_0^t div v dt.] 
+    # batch = batch.replace(div_pos_velocity=torch.zeros(batch.pos.shape[0], device=device)) # initialize divergence of position velocity to zero, will be updated at each step. (B, L, 3)
+    
+    batch = batch.replace(likelihood=p_1_likelihood, device=device) # initialize divergence of position velocity to zero, will be updated at each step. (B, L, 3)
+    batch = batch.replace(noise_likelihood=p_1_likelihood) # store noise likelihood seperately in case we want to seperate it out later
+    batch = batch.replace(div_pos_score=torch.zeros(batch.pos.shape[0], device=device)) # initialize div pos score to zero, will be updated at each step if score model returns it.
+    
     for i in range(N):
         # set the timestep
         t = torch.full((batch_size, ), timesteps[i], device=device)
@@ -223,14 +233,18 @@ def euler_maruyama_denoiser(
         # pos: div v = -1/2 g^2 (3N + div_pos_score)
         if "div_pos_score" in score:
             div_pos_score = score["div_pos_score"]
+            if div_pos_score.ndim == 2:
+                node_idx = torch.arange(batch.batch.size(0), device=batch.batch.device)
+                node_idx = node_idx - batch.ptr[batch.batch]
+                div_pos_score = div_pos_score[batch.batch, node_idx]
             # print(f"div pos score at step {i}: {div_pos_score}")
             
             # divergence of velocity field at current time
             dim = batch.pos.shape[-1] # dimension of position space, typically 3, 1 for testing
-            div_v_pos = -0.5 * diffusion["pos"][0]**2 * (dim * torch.bincount(batch.batch) + div_pos_score) 
-            
+            # div_v_pos = -0.5 * diffusion["pos"][0]**2 * (dim * torch.bincount(batch.batch) + div_pos_score)
+            div_v_pos = -0.5 * diffusion["pos"][0]**2 * (dim  + div_pos_score)
             # simple integration step: I_next = I_now + div_v(t) * dt
-            batch = batch.replace(div_pos_velocity= batch.div_pos_velocity - div_v_pos * (t_next - t)[0])
+            batch = batch.replace(likelihood=batch.likelihood - div_v_pos * (t_next - t)[0])
         
     return batch
             

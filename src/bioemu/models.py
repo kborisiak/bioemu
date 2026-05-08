@@ -448,7 +448,8 @@ class DiGConditionalScoreDivergenceModel(torch.nn.Module):
         # angle representation.
         pos_effective = x.pos
         
-        div_pos_score = 0
+        # div_pos_score = torch.zeros((pos_effective.shape[0], pos_effective.shape[1]))  # initialize divergence of position score to zero, will be accumulated over Hutchinson samples. (B, L)
+        div_pos_score = torch.zeros(pos_effective.shape[0], device=pos_effective.device)  # initialize divergence of position score to zero, will be accumulated over Hutchinson samples. (B,)
         for _ in range(self.hutchinson_samples):  # number of samples for Hutchinson's trace estimator, can be increased for better accuracy at the cost of compute.
             # Sample radamacher vector for Hutchinson's estimator. This should have the same shape as the input to the model.
             generator = torch.Generator(device=pos_effective.device)
@@ -473,9 +474,13 @@ class DiGConditionalScoreDivergenceModel(torch.nn.Module):
             )
             batch_index = x.batch
             v_pos = to_dense_batch(v_pos, batch_index)[0]  # [B, L, 3]
-            jvp_pos = to_dense_batch(jvp_pos, batch_index)[0]  #
-            div_pos_score += torch.einsum("bi,bi->b", v_pos.flatten(1, -1), jvp_pos.flatten(1, -1))  # accumulate Hutchinson's estimator for the divergence of the position score. This will be averaged over the number of samples taken in the Hutchinson's estimator.
-
+            jvp_pos = to_dense_batch(jvp_pos, batch_index)[0]  # [B, L, 3]
+            estimator = torch.einsum("bni,bni->bn", v_pos, jvp_pos)  # [B, L], this is the Hutchinson estimator for the divergence of the position score for each element in the batch.
+            
+            div_pos_score += estimator.flatten()  # accumulate Hutchinson's estimator for the divergence of the position score. This will be averaged over the number of samples taken in the Hutchinson's estimator.
+            # div_pos_score += torch.einsum("bi,bi->b", v_pos.flatten(1, -1), jvp_pos.flatten(1, -1))  # accumulate Hutchinson's estimator for the divergence of the position score. This will be averaged over the number of samples taken in the Hutchinson's estimator.
+            
+            
         div_pos_score = div_pos_score / self.hutchinson_samples # average over the number of samples in Hutchinson's estimator to get the final divergence estimate.
 
         return x.replace(pos=pos, node_orientations=node_orientations, div_pos_score=div_pos_score)

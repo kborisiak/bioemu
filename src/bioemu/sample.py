@@ -85,7 +85,7 @@ def main(
     filter_samples: bool = True,
     steering_config: str | Path | dict | None = None,
     base_seed: int | None = None,
-    seed: int | None = None,
+    seed_override: int | None = None,
 ) -> None:
     """
     Generate samples for a specified sequence, using a trained model.
@@ -119,7 +119,7 @@ def main(
             - resampling_interval: Resampling interval
             - potentials: Dict of potential configurations
         base_seed: Base random seed for sampling. If set, each batch's seed will be set to base_seed + (num samples already generated).
-        seed: Override base seed + index seeding and just use this seed for all batches. Useful for debugging to generate identical samples across runs.
+        seed_override: Override base seed + index seeding and just use this seed for all batches. Useful for debugging to generate identical samples across runs.
     """
 
     if base_seed is None:
@@ -256,16 +256,18 @@ def main(
                 f"{existing_num_samples} samples have been generated."
             )
             
-        if seed is None:
-            seed = base_seed + start_idx
+        if seed_override is None:
+            batch_seed = base_seed + start_idx
+        else:
+            batch_seed = seed_override
             
-        logger.info(f"Sampling with {seed=} ({base_seed=})")
+        logger.info(f"Sampling with {batch_seed=} ({base_seed=})")
         batch = generate_batch(
             score_model=score_model,
             sequence=sequence,
             sdes=sdes,
             batch_size=min(batch_size, n),
-            seed=seed,
+            seed=batch_seed,
             denoiser=denoiser,
             cache_embeds_dir=cache_embeds_dir,
             msa_file=msa_file,
@@ -342,7 +344,8 @@ def get_context_chemgraph(
         pair_embeds=pair_embeds,
         sequence=sequence,
         node_labels=node_labels,
-        div_pos_velocity=torch.tensor(0.0),
+        likelihood=torch.full((n,), float("nan")),
+        noise_likelihood=torch.full((n,), float("nan")),
     )
 
 
@@ -398,9 +401,10 @@ def generate_batch(
     node_orientations = torch.stack([x.node_orientations for x in sampled_chemgraphs]).to(
         "cpu"
     )  # [BS, L, 3, 3]
-    div_pos_velocity = torch.stack([x.div_pos_velocity for x in sampled_chemgraphs]).to("cpu")  # [BS, L, 3]
+    likelihood = torch.stack([x.likelihood for x in sampled_chemgraphs]).to("cpu")  # [BS, L]
+    noise_likelihood = torch.stack([x.noise_likelihood for x in sampled_chemgraphs]).to("cpu")  # [BS, L]
 
-    return {"pos": pos, "node_orientations": node_orientations, "div_pos_velocity": div_pos_velocity}
+    return {"pos": pos, "node_orientations": node_orientations, "likelihood": likelihood, "noise_likelihood": noise_likelihood}
 
 
 if __name__ == "__main__":

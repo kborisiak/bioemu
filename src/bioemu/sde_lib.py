@@ -146,7 +146,7 @@ class BaseVPSDE(SDE):
     def U_prior(self, x: torch.Tensor, batch_idx: torch.LongTensor | None = None) -> torch.Tensor:
         """Returns the potential energy of the prior distribution, up to an additive constant."""
         x, _= to_dense_batch(x, batch_idx) if batch_idx is not None else (x, None)
-        return 0.5 * torch.einsum("bij,bij->b", x, x)  # (batch_size,)
+        return 0.5 * torch.einsum("bij,bij->bi", x, x).flatten()  # (batch_size * num_nodes)
 
     def sde(
         self,
